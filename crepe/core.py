@@ -276,6 +276,8 @@ def predict(audio, sr, model_capacity='full',
                                 center=center, step_size=step_size,
                                 verbose=verbose)
     confidence = np.take(activation, _n_peaks(activation, n=n))
+    if n == 1:
+        confidence = confidence[:, 0]
 
     if viterbi:
         if n == 1:
