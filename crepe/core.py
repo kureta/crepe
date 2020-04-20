@@ -5,11 +5,12 @@ import os
 import re
 import sys
 
-from scipy.io import wavfile
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
-
+from scipy.io import wavfile
 # store as a global variable, since we only support a few models for now
+from scipy.signal import find_peaks
+
 models = {
     'tiny': None,
     'small': None,
@@ -92,11 +93,30 @@ def output_path(file, suffix, output_dir):
     return path
 
 
-def to_local_average_cents(salience, center=None):
-    """
-    find the weighted average cents near the argmax bin
-    """
+def _n_peaks(activation, n=1):
+    if activation.ndim == 2:
+        result = np.zeros((activation.shape[0], n), dtype=np.int)
+        for idx, frame in enumerate(activation):
+            p, props = find_peaks(frame, height=0)
+            nth_p = p[np.argsort(props['peak_heights'])][-n:]
+            result[idx] = nth_p
+        return np.sort(result, axis=1)
+    if activation.ndim == 1:
+        p, props = find_peaks(activation, height=0)
+        nth_p = p[np.argsort(props['peak_heights'])][-n:]
+        return np.sort(nth_p)
 
+    raise ValueError('Activation shape is wrong!')
+
+
+def _nth_of_n_peaks(activation, nth=0, n=1):
+    if activation.ndim == 2:
+        return _n_peaks(activation, n)[:, nth]
+    if activation.ndim == 1:
+        return _n_peaks(activation, n)[nth]
+
+
+def to_local_average_cents(salience, center=None, nth=0, n=1):
     if not hasattr(to_local_average_cents, 'cents_mapping'):
         # the bin number-to-cents mapping
         to_local_average_cents.cents_mapping = (
@@ -104,7 +124,7 @@ def to_local_average_cents(salience, center=None):
 
     if salience.ndim == 1:
         if center is None:
-            center = int(np.argmax(salience))
+            center = _nth_of_n_peaks(salience, nth=nth, n=n)
         start = max(0, center - 4)
         end = min(len(salience), center + 5)
         salience = salience[start:end]
@@ -113,13 +133,13 @@ def to_local_average_cents(salience, center=None):
         weight_sum = np.sum(salience)
         return product_sum / weight_sum
     if salience.ndim == 2:
-        return np.array([to_local_average_cents(salience[i, :]) for i in
+        return np.array([to_local_average_cents(salience[i, :], nth=nth, n=n) for i in
                          range(salience.shape[0])])
 
     raise Exception("label should be either 1d or 2d ndarray")
 
 
-def to_viterbi_cents(salience):
+def to_viterbi_cents(salience, nth=0, n=1):
     """
     Find the Viterbi path using a transition prior that induces pitch
     continuity.
@@ -146,10 +166,10 @@ def to_viterbi_cents(salience):
         starting, transition, emission
 
     # find the Viterbi path
-    observations = np.argmax(salience, axis=1)
+    observations = _nth_of_n_peaks(salience, nth=nth, n=n)
     path = model.predict(observations.reshape(-1, 1), [len(observations)])
 
-    return np.array([to_local_average_cents(salience[i, :], path[i]) for i in
+    return np.array([to_local_average_cents(salience[i, :], path[i], n=n) for i in
                      range(len(observations))])
 
 
@@ -213,7 +233,7 @@ def get_activation(audio, sr, model_capacity='full', center=True, step_size=10,
 
 
 def predict(audio, sr, model_capacity='full',
-            viterbi=False, center=True, step_size=10, verbose=1):
+            viterbi=False, center=True, step_size=10, verbose=1, n=1):
     """
     Perform pitch estimation on given audio
 
@@ -255,12 +275,22 @@ def predict(audio, sr, model_capacity='full',
     activation = get_activation(audio, sr, model_capacity=model_capacity,
                                 center=center, step_size=step_size,
                                 verbose=verbose)
-    confidence = activation.max(axis=1)
+    confidence = np.take(activation, _n_peaks(activation, n=n))
 
     if viterbi:
-        cents = to_viterbi_cents(activation)
+        if n == 1:
+            cents = to_viterbi_cents(activation, n=n)
+        else:
+            cents = np.zeros((activation.shape[0], n), dtype=np.float32)
+            for row_id in range(n):
+                cents[:, row_id] = to_viterbi_cents(activation, nth=row_id, n=n)
     else:
-        cents = to_local_average_cents(activation)
+        if n == 1:
+            cents = to_local_average_cents(activation, n=n)
+        else:
+            cents = np.zeros((activation.shape[0], n), dtype=np.float32)
+            for row_id in range(n):
+                cents[:, row_id] = to_local_average_cents(activation, nth=row_id, n=n)
 
     frequency = 10 * 2 ** (cents / 1200)
     frequency[np.isnan(frequency)] = 0
@@ -363,4 +393,3 @@ def process_file(file, output=None, model_capacity='full', viterbi=False,
         imwrite(plot_file, (255 * image).astype(np.uint8))
         if verbose:
             print("CREPE: Saved the salience plot at {}".format(plot_file))
-
